@@ -1,3 +1,11 @@
+import sys
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 from typing import Any
 import asyncio
 import httpx
@@ -12,22 +20,25 @@ mcp = FastMCP("weather", host="0.0.0.0", port=port)
 WEATHERAPI_BASE = "https://api.weatherapi.com/v1"
 USER_AGENT = "weather-app/1.0"
 
-# Get API key from environment variable
-API_KEY = os.getenv("WEATHERAPI_KEY")
+from collections import defaultdict
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Get API keys from environment variable (supports both WeatherAPI and OpenWeatherMap)
+WEATHERAPI_KEY = os.getenv("WEATHERAPI_KEY")
+OPENWEATHER_KEY = os.getenv("OPENWEATHER_APIKEY") or os.getenv("OPENWEATHER_API_KEY")
+API_KEY = WEATHERAPI_KEY
 
 async def make_weather_request(endpoint: str, params: dict[str, str]) -> dict[str, Any] | None:
     """Make a request to the WeatherAPI with proper error handling."""
-    # Check if API key is set
-    if not API_KEY:
-        print("ERROR: WeatherAPI key not set. Please set WEATHERAPI_KEY environment variable.")
+    if not WEATHERAPI_KEY:
         return None
         
     headers = {
         "User-Agent": USER_AGENT,
     }
-    # Add API key to parameters
-    params["key"] = API_KEY
-    
+    params["key"] = WEATHERAPI_KEY
     url = f"{WEATHERAPI_BASE}/{endpoint}"
     
     async with httpx.AsyncClient() as client:
@@ -45,6 +56,87 @@ async def make_weather_request(endpoint: str, params: dict[str, str]) -> dict[st
             print(f"Unexpected error: {e}")
             return None
 
+async def get_weather_from_openweather(city: str) -> str | None:
+    """Fetch current weather from OpenWeatherMap API."""
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"q": city, "appid": OPENWEATHER_KEY, "units": "metric"}
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(url, params=params, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()
+            name = data.get("name", city)
+            country = data.get("sys", {}).get("country", "")
+            main = data.get("main", {})
+            temp_c = main.get("temp", 0)
+            temp_f = round(temp_c * 9/5 + 32, 1)
+            feels_c = main.get("feels_like", 0)
+            feels_f = round(feels_c * 9/5 + 32, 1)
+            weather_desc = data.get("weather", [{}])[0].get("description", "").title()
+            humidity = main.get("humidity", 0)
+            wind_speed_ms = data.get("wind", {}).get("speed", 0)
+            wind_kph = round(wind_speed_ms * 3.6, 1)
+            wind_mph = round(wind_kph / 1.60934, 1)
+            pressure = main.get("pressure", 0)
+            vis_km = round(data.get("visibility", 10000) / 1000, 1)
+            
+            return f"""
+Current Weather for {name}, {country}:
+
+Temperature: {temp_c}°C ({temp_f}°F)
+Feels like: {feels_c}°C ({feels_f}°F)
+Condition: {weather_desc}
+Humidity: {humidity}%
+Wind: {wind_kph} km/h ({wind_mph} mph)
+Pressure: {pressure} mb
+Visibility: {vis_km} km
+"""
+        except Exception as e:
+            print(f"OpenWeather current weather error: {e}")
+            return None
+
+async def get_forecast_from_openweather(city: str, days: int = 3) -> str | None:
+    """Fetch weather forecast from OpenWeatherMap API."""
+    url = "https://api.openweathermap.org/data/2.5/forecast"
+    params = {"q": city, "appid": OPENWEATHER_KEY, "units": "metric"}
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.get(url, params=params, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.json()
+            city_name = data.get("city", {}).get("name", city)
+            country = data.get("city", {}).get("country", "")
+            
+            days_dict = defaultdict(list)
+            for item in data.get("list", []):
+                dt_txt = item.get("dt_txt", "")
+                date = dt_txt.split(" ")[0]
+                days_dict[date].append(item)
+            
+            forecasts = [f"Weather Forecast for {city_name}, {country}:"]
+            for date, items in list(days_dict.items())[:days]:
+                max_c = round(max(it["main"]["temp_max"] for it in items), 1)
+                min_c = round(min(it["main"]["temp_min"] for it in items), 1)
+                max_f = round(max_c * 9/5 + 32, 1)
+                min_f = round(min_c * 9/5 + 32, 1)
+                cond = items[len(items)//2]["weather"][0]["description"].title()
+                pop = int(max(it.get("pop", 0) for it in items) * 100)
+                max_wind = round(max(it.get("wind", {}).get("speed", 0) for it in items) * 3.6, 1)
+                
+                forecast = f"""
+{date}:
+High: {max_c}°C ({max_f}°F)
+Low: {min_c}°C ({min_f}°F)
+Condition: {cond}
+Chance of Rain: {pop}%
+Max Wind: {max_wind} km/h
+"""
+                forecasts.append(forecast)
+            return "\n---\n".join(forecasts)
+        except Exception as e:
+            print(f"OpenWeather forecast error: {e}")
+            return None
+
 @mcp.tool()
 async def get_current_weather(city: str) -> str:
     """Get current weather conditions for a city.
@@ -52,6 +144,11 @@ async def get_current_weather(city: str) -> str:
     Args:
         city: City name (e.g., "Hanoi", "Haiphong", "Danang", "Brisbane", "Sydney")
     """
+    if OPENWEATHER_KEY:
+        ow_res = await get_weather_from_openweather(city)
+        if ow_res:
+            return ow_res
+
     params = {
         "q": city,
         "aqi": "no"
@@ -60,8 +157,8 @@ async def get_current_weather(city: str) -> str:
     data = await make_weather_request("current.json", params)
 
     if not data:
-        if not API_KEY:
-            return f"❌ WeatherAPI key not configured. Please set WEATHERAPI_KEY environment variable with your API key from weatherapi.com"
+        if not WEATHERAPI_KEY and not OPENWEATHER_KEY:
+            return f"❌ Weather API key not configured. Please set OPENWEATHER_APIKEY or WEATHERAPI_KEY in .env"
         return f"Unable to fetch current weather data for {city}. Please check the city name and API key configuration."
 
     current = data["current"]
@@ -90,9 +187,13 @@ async def get_forecast(city: str, days: int = 3) -> str:
         city: City name (e.g., "Hanoi", "Haiphong", "Danang", "Brisbane", "Sydney", "Melbourne")
         days: Number of days to forecast (1-3 for free tier, max 10 for paid)
     """
-    # Limit days to 3 for free tier
     days = min(days, 3)
     
+    if OPENWEATHER_KEY:
+        ow_res = await get_forecast_from_openweather(city, days)
+        if ow_res:
+            return ow_res
+
     params = {
         "q": city,
         "days": str(days),
@@ -103,8 +204,8 @@ async def get_forecast(city: str, days: int = 3) -> str:
     data = await make_weather_request("forecast.json", params)
 
     if not data:
-        if not API_KEY:
-            return f"❌ WeatherAPI key not configured. Please set WEATHERAPI_KEY environment variable with your API key from weatherapi.com"
+        if not WEATHERAPI_KEY and not OPENWEATHER_KEY:
+            return f"❌ Weather API key not configured. Please set OPENWEATHER_APIKEY or WEATHERAPI_KEY in .env"
         return f"Unable to fetch forecast data for {city}. Please check the city name and API key configuration."
 
     location = data["location"]
@@ -139,14 +240,9 @@ print("✅ MCP server initialized with Streamable HTTP transport")
 print("🔧 Available tools: get_current_weather, get_forecast, health_check")
 
 if __name__ == "__main__":
-    import sys
-    
-    is_cloud_run = bool(os.getenv("PORT"))
-    is_standalone = len(sys.argv) == 1 and sys.stdin.isatty()
-    
-    if is_cloud_run or is_standalone:
-        print(f"🚀 Starting MCP server on http://0.0.0.0:{port}/mcp")
-        mcp.run(transport="streamable-http")
-    else:
+    if "--stdio" in sys.argv:
         print("Starting FastMCP server in stdio mode for local client", file=sys.stderr)
         mcp.run()
+    else:
+        print(f"🚀 Starting MCP server on http://0.0.0.0:{port}/mcp")
+        mcp.run(transport="streamable-http")
